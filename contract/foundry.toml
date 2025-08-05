@@ -1,0 +1,31 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.20"
+
+bytecode_hash = "none"
+cbor_metadata = false
+
+optimizer = true
+via_ir = true
+optimizer_runs = 2_000
+evm_version = "cancun"
+
+# https://github.com/foundry-rs/foundry/issues/6780#issuecomment-1962319449
+[profile.default.optimizer_details]
+constantOptimizer = true
+yul = true
+
+
+
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+[fuzz]
+runs = 100_000
+max_test_rejects = 1_000_000
+
+[invariant]
+fail_on_revert = true
+runs = 1_000
+depth = 20
