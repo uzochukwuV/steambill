@@ -1,0 +1,499 @@
+// marketplace-helpers.js
+import { ethers } from 'ethers';
+
+// Contract ABIs (you'll need to include the full ABIs from your compiled contracts)
+const PAYMENT_PROTOCOL_ABI = [
+  "function processPaymentPreApproved((bytes32,address,address,uint256,uint256,uint256,uint256,bytes)) external",
+  "function processPaymentWithPermit2((bytes32,address,address,uint256,uint256,uint256,uint256,bytes), ((address,uint256),uint256,uint256), (address,uint256), bytes) external",
+  "function calculateProtocolFee(uint256) external pure returns (uint256)",
+  "function getCurrentNonce(address) external view returns (uint256)",
+  "function isPaymentProcessed(bytes32) external view returns (bool)",
+  "function getPaymentHash((bytes32,address,address,uint256,uint256,uint256,uint256,bytes)) external view returns (bytes32)"
+];
+
+const MARKETPLACE_ABI = [
+  "function createListing(uint8,address,uint256,uint256,uint256,uint256,string,bytes32[]) external returns (bytes32)",
+  "function purchaseWithPreApproval(bytes32,uint256,(bytes32,address,address,uint256,uint256,uint256,uint256,bytes)) external",
+  "function purchaseWithPermit2(bytes32,uint256,(bytes32,address,address,uint256,uint256,uint256,uint256,bytes),((address,uint256),uint256,uint256,(address,uint256),bytes)) external",
+  "function getListing(bytes32) external view returns ((bytes32,address,uint8,address,uint256,uint256,uint256,uint256,uint8,string,bytes32[]))",
+  "function getSellerListings(address) external view returns (bytes32[])",
+  "function getBuyerPurchases(address) external view returns (bytes32[])",
+  "function calculateTotalCost(uint256) external view returns (uint256,uint256,uint256)",
+  "function cancelListing(bytes32) external",
+  "function updateListing(bytes32,uint256,uint256) external"
+];
+
+const MARKETPLACE_HELPER_ABI = [
+  "function getListingWithCosts(bytes32) external view returns ((bytes32,address,uint8,uint256,uint256,uint256,uint8,string,uint256))",
+  "function getMultipleListingsWithCosts(bytes32[]) external view returns ((bytes32,address,uint8,uint256,uint256,uint256,uint8,string,uint256)[])",
+  "function generatePaymentIntentTemplate(bytes32,uint256,address) external view returns (uint256,uint256,address,uint256,uint256)",
+  "function getActiveListingsBySeller(address,uint256,uint256) external view returns ((bytes32,address,uint8,uint256,uint256,uint256,uint8,string,uint256)[],uint256)",
+  "function canAffordPurchase(address,bytes32,uint256) external view returns (bool,uint256,uint256,uint256)"
+];
+
+const USDC_ABI = [
+  "function balanceOf(address) external view returns (uint256)",
+  "function allowance(address,address) external view returns (uint256)",
+  "function approve(address,uint256) external returns (bool)",
+  "function transfer(address,uint256) external returns (bool)"
+];
+
+// Contract addresses (update these with your deployed addresses)
+const CONTRACT_ADDRESSES = {
+  PAYMENT_PROTOCOL: '0x...', // Your payment protocol address
+  MARKETPLACE: '0x...', // Your marketplace address
+  MARKETPLACE_HELPER: '0x...', // Your marketplace helper address
+  USDC: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // Base USDC
+  PERMIT2: '0x000000000022D473030F116dDEE9F6B43aC78BA3' // Uniswap Permit2
+};
+
+// EIP-712 Domain for payment protocol
+const EIP712_DOMAIN = {
+  name: 'SimpleUSDCPaymentProtocol',
+  version: '1',
+  chainId: 8453, // Base mainnet
+  verifyingContract: CONTRACT_ADDRESSES.PAYMENT_PROTOCOL
+};
+
+// EIP-712 Types
+const PAYMENT_INTENT_TYPES = {
+  PaymentIntent: [
+    { name: 'id', type: 'bytes32' },
+    { name: 'sender', type: 'address' },
+    { name: 'recipient', type: 'address' },
+    { name: 'amount', type: 'uint256' },
+    { name: 'protocolFee', type: 'uint256' },
+    { name: 'deadline', type: 'uint256' },
+    { name: 'nonce', type: 'uint256' }
+  ]
+};
+
+/**
+ * Main MarketplaceHelper class
+ */
+export class MarketplaceHelper {
+  constructor(provider, signer = null) {
+    this.provider = provider;
+    this.signer = signer;
+    
+    // Initialize contract instances
+    this.paymentProtocol = new ethers.Contract(
+      CONTRACT_ADDRESSES.PAYMENT_PROTOCOL,
+      PAYMENT_PROTOCOL_ABI,
+      signer || provider
+    );
+    
+    this.marketplace = new ethers.Contract(
+      CONTRACT_ADDRESSES.MARKETPLACE,
+      MARKETPLACE_ABI,
+      signer || provider
+    );
+    
+    this.marketplaceHelper = new ethers.Contract(
+      CONTRACT_ADDRESSES.MARKETPLACE_HELPER,
+      MARKETPLACE_HELPER_ABI,
+      signer || provider
+    );
+    
+    this.usdc = new ethers.Contract(
+      CONTRACT_ADDRESSES.USDC,
+      USDC_ABI,
+      signer || provider
+    );
+  }
+
+  /**
+   * Update signer when user connects wallet
+   */
+  setSigner(signer) {
+    this.signer = signer;
+    this.paymentProtocol = this.paymentProtocol.connect(signer);
+    this.marketplace = this.marketplace.connect(signer);
+    this.marketplaceHelper = this.marketplaceHelper.connect(signer);
+    this.usdc = this.usdc.connect(signer);
+  }
+
+  /**
+   * Generate a unique payment ID
+   */
+  generatePaymentId(sender, recipient, amount, timestamp) {
+    return ethers.keccak256(
+      ethers.solidityPacked(
+        ['address', 'address', 'uint256', 'uint256'],
+        [sender, recipient, amount, timestamp]
+      )
+    );
+  }
+
+  /**
+   * Create and sign a payment intent
+   */
+  async createPaymentIntent(params) {
+    const {
+      recipient,
+      amount,
+      protocolFee,
+      deadline = Math.floor(Date.now() / 1000) + 3600 // 1 hour default
+    } = params;
+
+    if (!this.signer) {
+      throw new Error('Signer required for creating payment intent');
+    }
+
+    const sender = await this.signer.getAddress();
+    const nonce = await this.paymentProtocol.getCurrentNonce(sender);
+    const paymentId = this.generatePaymentId(sender, recipient, amount, Date.now());
+
+    const paymentIntent = {
+      id: paymentId,
+      sender,
+      recipient,
+      amount: ethers.parseUnits(amount.toString(), 6), // USDC has 6 decimals
+      protocolFee: ethers.parseUnits(protocolFee.toString(), 6),
+      deadline,
+      nonce
+    };
+
+    // Sign the payment intent
+    const signature = await this.signer.signTypedData(
+      EIP712_DOMAIN,
+      PAYMENT_INTENT_TYPES,
+      paymentIntent
+    );
+
+    return {
+      ...paymentIntent,
+      signature
+    };
+  }
+
+  /**
+   * Check USDC balance and allowance
+   */
+  async checkUSDCStatus(userAddress, spenderAddress = CONTRACT_ADDRESSES.MARKETPLACE) {
+    const balance = await this.usdc.balanceOf(userAddress);
+    const allowance = await this.usdc.allowance(userAddress, spenderAddress);
+    
+    return {
+      balance: ethers.formatUnits(balance, 6),
+      allowance: ethers.formatUnits(allowance, 6),
+      balanceWei: balance,
+      allowanceWei: allowance
+    };
+  }
+
+  /**
+   * Approve USDC spending
+   */
+  async approveUSDC(amount, spender = CONTRACT_ADDRESSES.MARKETPLACE) {
+    if (!this.signer) {
+      throw new Error('Signer required for approval');
+    }
+
+    const amountWei = ethers.parseUnits(amount.toString(), 6);
+    const tx = await this.usdc.approve(spender, amountWei);
+    return tx;
+  }
+
+  /**
+   * Create a new listing
+   */
+  async createListing(listingData) {
+    if (!this.signer) {
+      throw new Error('Signer required for creating listing');
+    }
+
+    const {
+      itemType, // 0=PHYSICAL, 1=ERC721, 2=ERC1155
+      tokenContract = ethers.ZeroAddress,
+      tokenId = 0,
+      quantity,
+      pricePerUnit,
+      duration, // in seconds
+      metadataURI = '',
+      tags = []
+    } = listingData;
+
+    const priceWei = ethers.parseUnits(pricePerUnit.toString(), 6);
+    
+    const tx = await this.marketplace.createListing(
+      itemType,
+      tokenContract,
+      tokenId,
+      quantity,
+      priceWei,
+      duration,
+      metadataURI,
+      tags
+    );
+
+    return tx;
+  }
+
+  /**
+   * Get listing with calculated costs
+   */
+  async getListingWithCosts(listingId) {
+    const listing = await this.marketplaceHelper.getListingWithCosts(listingId);
+    
+    return {
+      id: listing.id,
+      seller: listing.seller,
+      itemType: listing.itemType,
+      pricePerUnit: ethers.formatUnits(listing.pricePerUnit, 6),
+      quantity: listing.quantity.toString(),
+      expirationTime: listing.expirationTime.toString(),
+      status: listing.status,
+      metadataURI: listing.metadataURI,
+      totalCost: ethers.formatUnits(listing.totalCost, 6),
+      pricePerUnitWei: listing.pricePerUnit,
+      totalCostWei: listing.totalCost
+    };
+  }
+
+  /**
+   * Get multiple listings with costs
+   */
+  async getMultipleListingsWithCosts(listingIds) {
+    const listings = await this.marketplaceHelper.getMultipleListingsWithCosts(listingIds);
+    
+    return listings.map(listing => ({
+      id: listing.id,
+      seller: listing.seller,
+      itemType: listing.itemType,
+      pricePerUnit: ethers.formatUnits(listing.pricePerUnit, 6),
+      quantity: listing.quantity.toString(),
+      expirationTime: listing.expirationTime.toString(),
+      status: listing.status,
+      metadataURI: listing.metadataURI,
+      totalCost: ethers.formatUnits(listing.totalCost, 6),
+      pricePerUnitWei: listing.pricePerUnit,
+      totalCostWei: listing.totalCost
+    }));
+  }
+
+  /**
+   * Generate payment intent template for a purchase
+   */
+  async generatePaymentIntentTemplate(listingId, quantity, buyerAddress) {
+    const template = await this.marketplaceHelper.generatePaymentIntentTemplate(
+      listingId,
+      quantity,
+      buyerAddress
+    );
+
+    return {
+      amount: ethers.formatUnits(template.amount, 6),
+      protocolFee: ethers.formatUnits(template.protocolFee, 6),
+      recipient: template.recipient,
+      nonce: template.nonce.toString(),
+      suggestedDeadline: template.suggestedDeadline.toString(),
+      amountWei: template.amount,
+      protocolFeeWei: template.protocolFee
+    };
+  }
+
+  /**
+   * Purchase with pre-approved USDC
+   */
+  async purchaseWithPreApproval(listingId, quantity, paymentIntent) {
+    if (!this.signer) {
+      throw new Error('Signer required for purchase');
+    }
+
+    const tx = await this.marketplace.purchaseWithPreApproval(
+      listingId,
+      quantity,
+      paymentIntent
+    );
+
+    return tx;
+  }
+
+  /**
+   * Complete purchase flow with pre-approval
+   */
+  async completePurchaseWithPreApproval(listingId, quantity) {
+    if (!this.signer) {
+      throw new Error('Signer required for purchase');
+    }
+
+    const userAddress = await this.signer.getAddress();
+
+    // 1. Get payment template
+    const template = await this.generatePaymentIntentTemplate(
+      listingId,
+      quantity,
+      userAddress
+    );
+
+    // 2. Check if user has enough USDC and allowance
+    const usdcStatus = await this.checkUSDCStatus(userAddress);
+    const totalCost = parseFloat(template.amount) + parseFloat(template.protocolFee);
+
+    if (parseFloat(usdcStatus.balance) < totalCost) {
+      throw new Error(`Insufficient USDC balance. Need ${totalCost}, have ${usdcStatus.balance}`);
+    }
+
+    if (parseFloat(usdcStatus.allowance) < totalCost) {
+      // 3. Approve USDC if needed
+      console.log('Approving USDC...');
+      const approveTx = await this.approveUSDC(totalCost);
+      await approveTx.wait();
+    }
+
+    // 4. Create and sign payment intent
+    const paymentIntent = await this.createPaymentIntent({
+      recipient: template.recipient,
+      amount: template.amount,
+      protocolFee: template.protocolFee,
+      deadline: parseInt(template.suggestedDeadline)
+    });
+
+    // 5. Execute purchase
+    const purchaseTx = await this.purchaseWithPreApproval(
+      listingId,
+      quantity,
+      paymentIntent
+    );
+
+    return {
+      paymentIntent,
+      transaction: purchaseTx
+    };
+  }
+
+  /**
+   * Get seller's listings with pagination
+   */
+  async getSellerListings(sellerAddress, offset = 0, limit = 10) {
+    const result = await this.marketplaceHelper.getActiveListingsBySeller(
+      sellerAddress,
+      offset,
+      limit
+    );
+
+    return {
+      listings: result.listings.map(listing => ({
+        id: listing.id,
+        seller: listing.seller,
+        itemType: listing.itemType,
+        pricePerUnit: ethers.formatUnits(listing.pricePerUnit, 6),
+        quantity: listing.quantity.toString(),
+        expirationTime: listing.expirationTime.toString(),
+        status: listing.status,
+        metadataURI: listing.metadataURI,
+        totalCost: ethers.formatUnits(listing.totalCost, 6)
+      })),
+      total: result.total.toString()
+    };
+  }
+
+  /**
+   * Cancel a listing
+   */
+  async cancelListing(listingId) {
+    if (!this.signer) {
+      throw new Error('Signer required for canceling listing');
+    }
+
+    const tx = await this.marketplace.cancelListing(listingId);
+    return tx;
+  }
+
+  /**
+   * Update a listing
+   */
+  async updateListing(listingId, newPrice, newQuantity) {
+    if (!this.signer) {
+      throw new Error('Signer required for updating listing');
+    }
+
+    const priceWei = ethers.parseUnits(newPrice.toString(), 6);
+    const tx = await this.marketplace.updateListing(listingId, priceWei, newQuantity);
+    return tx;
+  }
+
+  /**
+   * Check if user can afford a purchase
+   */
+  async canAffordPurchase(buyerAddress, listingId, quantity) {
+    const result = await this.marketplaceHelper.canAffordPurchase(
+      buyerAddress,
+      listingId,
+      quantity
+    );
+
+    return {
+      canAfford: result.canAfford,
+      requiredAmount: ethers.formatUnits(result.requiredAmount, 6),
+      userBalance: ethers.formatUnits(result.userBalance, 6),
+      userAllowance: ethers.formatUnits(result.userAllowance, 6)
+    };
+  }
+
+  /**
+   * Get transaction status and details
+   */
+  async getTransactionStatus(txHash) {
+    try {
+      const receipt = await this.provider.getTransactionReceipt(txHash);
+      if (!receipt) {
+        return { status: 'pending' };
+      }
+
+      return {
+        status: receipt.status === 1 ? 'success' : 'failed',
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed.toString(),
+        receipt
+      };
+    } catch (error) {
+      return { status: 'error', error: error.message };
+    }
+  }
+
+  /**
+   * Utility: Format USDC amount for display
+   */
+  formatUSDC(amount, decimals = 2) {
+    return parseFloat(amount).toFixed(decimals);
+  }
+
+  /**
+   * Utility: Parse USDC amount to wei
+   */
+  parseUSDC(amount) {
+    return ethers.parseUnits(amount.toString(), 6);
+  }
+}
+
+// React hook for using the marketplace helper
+export const useMarketplace = (provider, signer) => {
+  const [helper, setHelper] = useState(null);
+
+  useEffect(() => {
+    if (provider) {
+      const marketplaceHelper = new MarketplaceHelper(provider, signer);
+      setHelper(marketplaceHelper);
+    }
+  }, [provider, signer]);
+
+  return helper;
+};
+
+// Constants export
+export const ITEM_TYPES = {
+  PHYSICAL: 0,
+  ERC721: 1,
+  ERC1155: 2
+};
+
+export const LISTING_STATUS = {
+  ACTIVE: 0,
+  SOLD: 1,
+  CANCELLED: 2,
+  EXPIRED: 3
+};
+
+export { CONTRACT_ADDRESSES };
